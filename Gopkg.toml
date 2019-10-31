@@ -15,10 +15,6 @@
   name = "github.com/Azure/go-autorest"
   revision = "1ff28809256a84bb6966640ff3d0371af82ccba4"
 
-[[constraint]]
-  name = "github.com/docker/cli"
-  revision = "f95ca8e1ba6c22c9abcdbf65e8dcc39c53958bba"
-
 [[override]]
   name = "github.com/docker/docker"
   revision = "f76d6a078d881f410c00e8d900dcdfc2e026c841"

@@ -3,6 +3,8 @@ package docker
 import (
 	"archive/tar"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -10,16 +12,12 @@ import (
 	unix_path "path"
 
 	"github.com/deislabs/cnab-go/driver"
-	"github.com/docker/cli/cli/command"
-	cliflags "github.com/docker/cli/cli/flags"
-	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/strslice"
-	"github.com/docker/docker/client"
+	dockerClient "github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/jsonmessage"
 	"github.com/docker/docker/pkg/stdcopy"
-	"github.com/docker/docker/registry"
 )
 
 // Driver is capable of running Docker invocation images using Docker itself.
@@ -27,7 +25,8 @@ type Driver struct {
 	config map[string]string
 	// If true, this will not actually run Docker
 	Simulate                   bool
-	dockerCli                  command.Cli
+	client                     dockerClient.APIClient
+	registryAuthConfig         types.AuthConfig
 	dockerConfigurationOptions []ConfigurationOption
 	containerOut               io.Writer
 	containerErr               io.Writer
@@ -73,8 +72,8 @@ func (d *Driver) SetConfig(settings map[string]string) {
 }
 
 // SetDockerCli makes the driver use an already initialized cli
-func (d *Driver) SetDockerCli(dockerCli command.Cli) {
-	d.dockerCli = dockerCli
+func (d *Driver) SetDockerClient(client dockerClient.APIClient) {
+	d.client = client
 }
 
 // SetContainerOut sets the container output stream
@@ -87,66 +86,41 @@ func (d *Driver) SetContainerErr(w io.Writer) {
 	d.containerErr = w
 }
 
-func pullImage(ctx context.Context, cli command.Cli, image string) error {
-	ref, err := reference.ParseNormalizedNamed(image)
+// EncodeAuthToBase64 serializes the auth configuration as JSON base64 payload
+func encodeAuthToBase64(authConfig types.AuthConfig) (string, error) {
+	buf, err := json.Marshal(authConfig)
 	if err != nil {
-		return err
+		return "", err
 	}
+	return base64.URLEncoding.EncodeToString(buf), nil
+}
 
-	// Resolve the Repository name from fqn to RepositoryInfo
-	repoInfo, err := registry.ParseRepositoryInfo(ref)
-	if err != nil {
-		return err
-	}
-	authConfig := command.ResolveAuthConfig(ctx, cli, repoInfo.Index)
-	encodedAuth, err := command.EncodeAuthToBase64(authConfig)
+func (d *Driver) pullImage(ctx context.Context, image string) error {
+	encodedAuth, err := encodeAuthToBase64(d.registryAuthConfig)
 	if err != nil {
 		return err
 	}
 	options := types.ImagePullOptions{
 		RegistryAuth: encodedAuth,
 	}
-	responseBody, err := cli.Client().ImagePull(ctx, image, options)
+	responseBody, err := d.client.ImagePull(ctx, image, options)
 	if err != nil {
 		return err
 	}
 	defer responseBody.Close()
 
 	// passing isTerm = false here because of https://github.com/Nvveen/Gotty/pull/1
-	return jsonmessage.DisplayJSONMessagesStream(responseBody, cli.Out(), cli.Out().FD(), false, nil)
-}
-
-func (d *Driver) initializeDockerCli() (command.Cli, error) {
-	if d.dockerCli != nil {
-		return d.dockerCli, nil
-	}
-	cli, err := command.NewDockerCli()
-	if err != nil {
-		return nil, err
-	}
-	if d.config["DOCKER_DRIVER_QUIET"] == "1" {
-		cli.Apply(command.WithCombinedStreams(ioutil.Discard))
-	}
-	if err := cli.Initialize(cliflags.NewClientOptions()); err != nil {
-		return nil, err
-	}
-	d.dockerCli = cli
-	return cli, nil
+	return jsonmessage.DisplayJSONMessagesStream(responseBody, os.Stdout, os.Stdout.Fd(), false, nil)
 }
 
 func (d *Driver) exec(op *driver.Operation) (driver.OperationResult, error) {
 	ctx := context.Background()
 
-	cli, err := d.initializeDockerCli()
-	if err != nil {
-		return driver.OperationResult{}, err
-	}
-
 	if d.Simulate {
 		return driver.OperationResult{}, nil
 	}
 	if d.config["PULL_ALWAYS"] == "1" {
-		if err := pullImage(ctx, cli, op.Image.Image); err != nil {
+		if err := d.pullImage(ctx, op.Image.Image); err != nil {
 			return driver.OperationResult{}, err
 		}
 	}
@@ -170,14 +144,14 @@ func (d *Driver) exec(op *driver.Operation) (driver.OperationResult, error) {
 		}
 	}
 
-	resp, err := cli.Client().ContainerCreate(ctx, cfg, hostCfg, nil, "")
+	resp, err := d.client.ContainerCreate(ctx, cfg, hostCfg, nil, "")
 	switch {
-	case client.IsErrNotFound(err):
-		fmt.Fprintf(cli.Err(), "Unable to find image '%s' locally\n", op.Image.Image)
-		if err := pullImage(ctx, cli, op.Image.Image); err != nil {
+	case dockerClient.IsErrNotFound(err):
+		fmt.Fprintf(os.Stderr, "Unable to find image '%s' locally\n", op.Image.Image)
+		if err := d.pullImage(ctx, op.Image.Image); err != nil {
 			return driver.OperationResult{}, err
 		}
-		if resp, err = cli.Client().ContainerCreate(ctx, cfg, hostCfg, nil, ""); err != nil {
+		if resp, err = d.client.ContainerCreate(ctx, cfg, hostCfg, nil, ""); err != nil {
 			return driver.OperationResult{}, fmt.Errorf("cannot create container: %v", err)
 		}
 	case err != nil:
@@ -185,7 +159,7 @@ func (d *Driver) exec(op *driver.Operation) (driver.OperationResult, error) {
 	}
 
 	if d.config["CLEANUP_CONTAINERS"] == "true" {
-		defer cli.Client().ContainerRemove(ctx, resp.ID, types.ContainerRemoveOptions{})
+		defer d.client.ContainerRemove(ctx, resp.ID, types.ContainerRemoveOptions{})
 	}
 
 	tarContent, err := generateTar(op.Files)
@@ -197,12 +171,12 @@ func (d *Driver) exec(op *driver.Operation) (driver.OperationResult, error) {
 	}
 	// This copies the tar to the root of the container. The tar has been assembled using the
 	// path from the given file, starting at the /.
-	err = cli.Client().CopyToContainer(ctx, resp.ID, "/", tarContent, options)
+	err = d.client.CopyToContainer(ctx, resp.ID, "/", tarContent, options)
 	if err != nil {
 		return driver.OperationResult{}, fmt.Errorf("error copying to / in container: %s", err)
 	}
 
-	attach, err := cli.Client().ContainerAttach(ctx, resp.ID, types.ContainerAttachOptions{
+	attach, err := d.client.ContainerAttach(ctx, resp.ID, types.ContainerAttachOptions{
 		Stream: true,
 		Stdout: true,
 		Stderr: true,
@@ -231,8 +205,8 @@ func (d *Driver) exec(op *driver.Operation) (driver.OperationResult, error) {
 		}
 	}()
 
-	statusc, errc := cli.Client().ContainerWait(ctx, resp.ID, container.WaitConditionNextExit)
-	if err = cli.Client().ContainerStart(ctx, resp.ID, types.ContainerStartOptions{}); err != nil {
+	statusc, errc := d.client.ContainerWait(ctx, resp.ID, container.WaitConditionNextExit)
+	if err = d.client.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{}); err != nil {
 		return driver.OperationResult{}, fmt.Errorf("cannot start container: %v", err)
 	}
 	select {
@@ -280,7 +254,7 @@ func (d *Driver) fetchOutputs(ctx context.Context, container string, op *driver.
 	if len(op.Outputs) == 0 {
 		return opResult, nil
 	}
-	ioReader, _, err := d.dockerCli.Client().CopyFromContainer(ctx, container, "/cnab/app/outputs")
+	ioReader, _, err := d.client.CopyFromContainer(ctx, container, "/cnab/app/outputs")
 	if err != nil {
 		return opResult, fmt.Errorf("error copying outputs from container: %s", err)
 	}
